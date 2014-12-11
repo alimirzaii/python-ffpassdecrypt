@@ -1,58 +1,86 @@
 #!/usr/bin/env python
 """
-  Recovers your Firefox or Thunderbird passwords
+Recovers your Firefox or Thunderbird passwords
+
+Author : Tobias Mueller
 """
 
-import base64
-from collections import namedtuple
-from ConfigParser import RawConfigParser, NoOptionError
-from ctypes import (Structure, CDLL, byref, cast, string_at, c_void_p,
-	c_uint, c_ubyte, c_char_p)
-from getpass import getpass
-import logging
-from optparse import OptionParser
+import sys
 import os
+
+try:
+	# try to use the python-nss lib from mozilla
+#	import nss
+#except ImportError:
+	# fall back to dlopen of libnss3.so
+	from ctypes import (
+		CDLL, Structure,
+		c_void_p, c_uint, c_ubyte, c_char_p,
+		byref, cast, string_at,
+	)
+
+	#### libnss definitions
+	class SECItem(Structure):
+		_fields_ = [('type',c_uint),('data',c_void_p),('len',c_uint)]
+
+	class secuPWData(Structure):
+		_fields_ = [('source',c_ubyte),('data',c_char_p)]
+
+	(PW_NONE, PW_FROMFILE, PW_PLAINTEXT, PW_EXTERNAL) = (0, 1, 2, 3)
+	# SECStatus
+	(SECWouldBlock, SECFailure, SECSuccess) = (-2, -1, 0)
+	#### end of libnss definitions
+
+	#except ImportError as e:
+	#	print 'Failed to find either nss or ctypes library.'
+	#	raise
+except ImportError: pass
+
 try:
 	from sqlite3 import dbapi2 as sqlite
 except ImportError:
 	from pysqlite2 import dbapi2 as sqlite
+
+import base64
+from getpass import getpass
+import logging
+from optparse import OptionParser
+from collections import namedtuple
+from ConfigParser import RawConfigParser, NoOptionError
+
 from subprocess import Popen, CalledProcessError, PIPE
-import sys
 
 
 LOGLEVEL_DEFAULT = 'warn'
 
 log = logging.getLogger()
-PWDECRYPT = 'pwdecrypt'
+#PWDECRYPT = 'pwdecrypt'
+PWDECRYPT = '/usr/bin/pwdecrypt' # from libnss3-tools
 
 SITEFIELDS = ['id', 'hostname', 'httpRealm', 'formSubmitURL', 'usernameField', 'passwordField', 'encryptedUsername', 'encryptedPassword', 'guid', 'encType', 'plain_username', 'plain_password' ]
 Site = namedtuple('FirefoxSite', SITEFIELDS)
-'''The format of the SQLite database is:
-(id                 INTEGER PRIMARY KEY,hostname           TEXT NOT NULL,httpRealm          TEXT,formSubmitURL      TEXT,usernameField      TEXT NOT NULL,passwordField      TEXT NOT NULL,encryptedUsername  TEXT NOT NULL,encryptedPassword  TEXT NOT NULL,guid               TEXT,encType            INTEGER);
+'''The format of the SQLite database is (2011):
+(id                 INTEGER PRIMARY KEY,
+ hostname           TEXT NOT NULL,
+ httpRealm          TEXT,
+ formSubmitURL      TEXT,
+ usernameField      TEXT NOT NULL,
+ passwordField      TEXT NOT NULL,
+ encryptedUsername  TEXT NOT NULL,
+ encryptedPassword  TEXT NOT NULL,
+ guid               TEXT,
+ encType            INTEGER);
 '''
 
 
-
-#### These are libnss definitions ####
-class SECItem(Structure):
-	_fields_ = [('type',c_uint),('data',c_void_p),('len',c_uint)]
-
-class secuPWData(Structure):
-	_fields_ = [('source',c_ubyte),('data',c_char_p)]
-
-(PW_NONE, PW_FROMFILE, PW_PLAINTEXT, PW_EXTERNAL) = (0, 1, 2, 3)
-# SECStatus
-(SECWouldBlock, SECFailure, SECSuccess) = (-2, -1, 0)
-#### End of libnss definitions ####
-
-
-def get_default_firefox_profile_directory(dir='~/.mozilla/firefox'):
-	'''Returns the directory name of the default profile
+def get_default_firefox_profile_directory(profiledir='~/.mozilla/firefox'):
+	"""Returns the directory name of the default profile
 
 	If you changed the default dir to something like ~/.thunderbird,
-	you would get the Thunderbird default profile directory.'''
+	you would get the Thunderbird default profile directory.
+	"""
 
-	profiles_dir = os.path.expanduser(dir)
+	profiles_dir = os.path.expanduser(profiledir)
 	profile_path = None
 
 	cp = RawConfigParser()
@@ -72,11 +100,11 @@ def get_default_firefox_profile_directory(dir='~/.mozilla/firefox'):
 
 
 def get_encrypted_sites(firefox_profile_dir=None):
-	'Opens signons.sqlite and yields encryped password data'
+	"""Opens signons.sqlite and yields encryped password data"""
 
 	if firefox_profile_dir is None:
 		firefox_profile_dir = get_default_firefox_profile_directory()
-	password_sqlite = os.path.join(firefox_profile_dir, "signons.sqlite")
+	signons_db = os.path.join(firefox_profile_dir, "signons.sqlite")
 	query = '''SELECT id, hostname, httpRealm, formSubmitURL,
 		usernameField, passwordField, encryptedUsername,
 		encryptedPassword, guid, encType, 'noplainuser', 'noplainpasswd' FROM moz_logins;'''
@@ -91,23 +119,24 @@ def get_encrypted_sites(firefox_profile_dir=None):
 	#query = '''SELECT %s
 	#			FROM moz_logins;''' % ', '.join(queryfields)
 
-	connection = sqlite.connect(password_sqlite)
+	conn = sqlite.connect(signons_db)
 	try:
-		cursor = connection.cursor()
+		cursor = conn.cursor()
 		cursor.execute(query)
 
 		for site in map(Site._make, cursor.fetchall()):
 			yield site
 	finally:
-		connection.close()
+		conn.close()
 
 def decrypt(encrypted_string, firefox_profile_directory, password = None):
-	'''Opens an external tool to decrypt strings
+	"""Opens an external tool to decrypt strings
 
 	This is mostly for historical reasons or if the API changes. It is
 	very slow because it needs to call out a lot. It uses the
 	"pwdecrypt" tool which you might have packaged. Otherwise, you
-	need to build it yourself.'''
+	need to build it yourself.
+	"""
 
 	log = logging.getLogger('firefoxpasswd.decrypt')
 	execute = [PWDECRYPT, '-d', firefox_profile_directory]
@@ -132,12 +161,13 @@ def decrypt(encrypted_string, firefox_profile_directory, password = None):
 
 
 class NativeDecryptor(object):
-	'Calls the NSS API to decrypt strings'
+	"""Calls the NSS API to decrypt strings"""
 
 	def __init__(self, directory, password = ''):
-		'''You need to give the profile directory and optionally a
+		"""You need to give the profile directory and optionally a
 		password. If you don't give a password but one is needed, you
-		will be prompted by getpass to provide one.'''
+		will be prompted by getpass to provide one.
+		"""
 		self.directory = directory
 		self.log = logging.getLogger('NativeDecryptor')
 		self.log.debug('Trying to work on %s', directory)
@@ -205,7 +235,7 @@ class NativeDecryptor(object):
 
 
 	def decrypt(self, string, *args):
-		'Decrypts a given string'
+		"""Decrypts a given string"""
 
 		libnss =  self.libnss
 
@@ -230,14 +260,14 @@ class NativeDecryptor(object):
 
 
 	def encrypted_sites(self):
-		'Yields the encryped passwords from the profile'
+		"""Yields the encryped passwords from the profile"""
 		sites = get_encrypted_sites(self.directory)
 
 		return sites
 
 
 	def decrypted_sites(self):
-		'Decrypts the encrypted_sites and yields the results'
+		"""Decrypts the encrypted_sites and yields the results"""
 
 		sites = self.encrypted_sites()
 
@@ -251,7 +281,7 @@ class NativeDecryptor(object):
 
 
 def get_firefox_sites_with_decrypted_passwords(firefox_profile_directory = None, password = None):
-	'Old school decryption of passwords using the external tool'
+	"""decryption of passwords using the external pwdecrypt program"""
 	if not firefox_profile_directory:
 		firefox_profile_directory = get_default_firefox_profile_directory()
 	#decrypt = NativeDecryptor(firefox_profile_directory).decrypt
@@ -264,7 +294,7 @@ def get_firefox_sites_with_decrypted_passwords(firefox_profile_directory = None,
 		yield site
 
 def main_decryptor(firefox_profile_directory, password, thunderbird=False):
-	'Main function to get Firefox and Thunderbird passwords'
+	"""Main function to get Firefox and Thunderbird passwords"""
 	if not firefox_profile_directory:
 		if thunderbird:
 			dir = '~/.thunderbird/'
@@ -277,7 +307,7 @@ def main_decryptor(firefox_profile_directory, password, thunderbird=False):
 	for site in decryptor.decrypted_sites():
 		print site
 
-if __name__ == "__main__":
+def main():
 	parser = OptionParser()
 	parser.add_option("-d", "--directory", default=None,
 		help="the Firefox profile directory to use")
@@ -314,3 +344,6 @@ if __name__ == "__main__":
 	else:
 		for site in get_firefox_sites_with_decrypted_passwords(options.directory, password):
 			print site
+
+if __name__ == '__main__':
+	main()
